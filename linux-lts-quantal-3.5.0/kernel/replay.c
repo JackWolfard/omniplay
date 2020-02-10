@@ -651,7 +651,6 @@ unsigned int replay_perf_data_size = (2 * PAGE_SIZE); //default to counting inst
 
 unsigned int replay_ckpt_dir = 0;  //this means do nothing
 
-
 // If the replay clock is greater than this value, MPRINT out the syscalls made by pin
 unsigned long pin_debug_clock = LONG_MAX;
 
@@ -690,6 +689,29 @@ struct syscall_result {
 	short			sysnum;		// system call number executed
 	u_char                  flags;          // See defs above
 };
+
+// Used for detecting output data divergences
+#define ODT_ENABLE
+
+#ifdef ODT_ENABLE
+#define ODT_STATIC_DATA_SIZE 10
+
+unsigned int size_odtlog_in_memory = 20000;
+unsigned int record_output_data_tracking = 0; // toggle odt divergence check
+
+struct syscall_odt {
+    short sysnum;
+    u_int static_data[ODT_STATIC_DATA_SIZE]; 
+};
+
+static void write_and_free_odt_log(struct record_thread *prect);
+static struct file *init_odt_log_write(struct record_thread *prect,
+                                       loff_t *ppos, int *pfd);
+static ssize_t write_odt_log_data(struct file *file, loff_t *ppos,
+                                  struct record_thread *prect,
+                                  struct syscall_odt *pso, int count);
+// just reuse term_log_write(struct file *file, int fd);
+#endif
 
 // This holds a memory range that should be preallocated
 struct reserved_mapping {
@@ -984,6 +1006,12 @@ struct record_thread {
 #endif
 
 	struct record_cache_files* rp_cache_files; // Info about open cache files
+#ifdef ODT_ENABLE
+    char rp_odtlog_opened; // if odt log file has been opened
+    loff_t rp_odtlog_read_pos;
+    struct syscall_odt *rp_odt_log; // pointer to in memory odt logs
+    unsigned int rp_odt_in_memory; // # of odt logs in memory currently
+#endif
 };
 
 /* FIXME: Put this somewhere that doesn't suck */
@@ -16010,6 +16038,145 @@ int do_is_record(struct ctl_table *table, int write, void __user *buffer,
 	return 0;
 }
 
+#ifdef ODT_ENABLE
+static void write_and_free_odt_log(struct record_thread *prect) {
+	int fd = 0;
+	struct syscall_odt *write_pso;
+	loff_t pos;
+	struct file *file = NULL;
+	mm_segment_t old_fs;
+
+	sync_filemap();
+	sync_write_inode_data(prect);
+	old_fs = get_fs();
+	set_fs(KERNEL_DS);
+	file = init_odt_log_write(prect, &pos, &fd);
+	if (file) {
+		write_pso = prect->rp_odt_log;
+		write_odt_log_data (file, &pos, prect, write_pso,
+                            prect->rp_odt_in_memory);
+		term_log_write (file, fd);
+	}
+	set_fs(old_fs);
+}
+
+static struct file *init_odt_log_write(struct record_thread *prect,
+                                       loff_t *ppos, int *pfd) {
+	char filename[MAX_LOGDIR_STRLEN + 20];
+	struct stat64 st;
+	mm_segment_t old_fs;
+	int rc;
+	struct file *ret = NULL;
+	int flags;
+
+	debug_flag = 0;
+
+	sprintf(filename, "%s/odtlog.id.%d", prect->rp_group->rg_logdir,
+            prect->rp_record_pid);
+
+	old_fs = get_fs();
+	set_fs(KERNEL_DS);
+	if (prect->rp_odtlog_opened) {
+		rc = sys_stat64(filename, &st);
+		if (rc < 0) {
+			printk ("Stat of file %s failed\n", filename);
+			ret = NULL;
+			goto out;
+		}
+		*ppos = st.st_size;
+		flags = O_WRONLY | O_APPEND | O_LARGEFILE;
+		*pfd = sys_open(filename, flags, 0777);
+		MPRINT ("Reopened log file %s, pos = %ld\n", filename, (long) *ppos);
+	} else {
+		flags = O_WRONLY | O_CREAT | O_TRUNC | O_LARGEFILE;
+		*pfd = sys_open(filename, flags, 0777);
+		if (*pfd > 0) {
+			rc = sys_fchmod(*pfd, 0777);
+			if (rc == -1) {
+				printk("Pid %d fchmod of odtlog %s failed\n", current->pid,
+                       filename);
+			}
+		}
+		MPRINT ("Opened log file %s\n", filename);
+		*ppos = 0;
+		prect->rp_odtlog_opened = 1;
+	}
+	set_fs(old_fs);
+	if (*pfd < 0) {
+		dump_stack();
+		printk ("%s %d: Cannot open log file %s, rc = %d flags = %d\n", __func__,
+				__LINE__, filename, *pfd, flags);
+		ret = NULL;
+		goto out;
+	}
+	ret = fget(*pfd);
+out:
+	debug_flag = 0;
+	return ret;
+}
+
+static ssize_t write_odt_log_data(struct file *file, loff_t *ppos,
+                                  struct record_thread *prect,
+                                  struct syscall_odt *pso, int count) {
+	ssize_t copyed = 0;
+	int kcnt = 0;
+
+	if (count <= 0) {
+        return 0;
+    }
+
+	MPRINT ("Pid %d, start write odtlog data\n", current->pid);
+
+	/* First write out syscall records in a bunch */
+	copyed = vfs_write(file, (char *) &count, sizeof(count), ppos);
+	if (copyed != sizeof(count)) {
+		printk("write_log_data: tried to write record count, got rc %d\n",
+               copyed);
+		return -EINVAL;
+	}
+
+	MPRINT("Pid %d write_log_data count %d, size %d\n", current->pid, count,
+           sizeof(struct syscall_odt) * count);
+
+	copyed = vfs_write(file, (char *) psr, sizeof(struct syscall_result)*count, ppos);
+	if (copyed != sizeof(struct syscall_result)*count) {
+		printk ("write_log_data: tried to write %d, got rc %d\n", sizeof(struct syscall_result)*count, copyed);
+		KFREE (pvec);
+		return -EINVAL;
+	}
+
+	/* Now write ancillary data - count of bytes goes first */
+	data_len = 0;
+	list_for_each_entry_reverse (node, &prect->rp_argsalloc_list, list) {
+		data_len += node->pos - node->head;
+	}
+	MPRINT ("Ancillary data written is %lu\n", data_len);
+	copyed = vfs_write(file, (char *) &data_len, sizeof(data_len), ppos);
+	if (copyed != sizeof(count)) {
+		printk ("write_log_data: tried to write ancillary data length, got rc %d\n", copyed);
+		KFREE (pvec);
+		return -EINVAL;
+	}
+
+	list_for_each_entry_reverse (node, &prect->rp_argsalloc_list, list) {
+		MPRINT ("Pid %d argssize write buffer slab size %d\n", current->pid, node->pos - node->head);
+		pvec[kcnt].iov_base = node->head;
+		pvec[kcnt].iov_len = node->pos - node->head;
+		if (++kcnt == UIO_MAXIOV) {
+			copyed = vfs_writev (file, pvec, kcnt, ppos);
+			kcnt = 0;
+		}
+	}
+
+	vfs_writev (file, pvec, kcnt, ppos); // Write any remaining data before exit
+	
+	DPRINT ("Wrote %d bytes to the file for sysnum %d\n", copyed, psr->sysnum);
+	KFREE (pvec);
+
+	return copyed;
+}
+#endif
+
 int btree_print = 0;
 int btree_print_init = 0;
 int replayfs_btree128_do_verify = 0;
@@ -16451,6 +16618,23 @@ static struct ctl_table replay_ctl[] = {
 		.mode		= 0644,
 		.proc_handler	= &proc_dointvec,
 	},
+
+#ifdef ODT_ENABLE
+	{
+		.procname	= "record_output_data_tracking",
+		.data		= &record_output_data_tracking,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= &proc_dointvec,
+	},
+	{
+		.procname	= "size_odtlog_in_memory",
+		.data		= &size_odtlog_in_memory,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= &proc_dointvec,
+	},
+#endif
 
 	{0, },
 };
