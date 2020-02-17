@@ -61,6 +61,10 @@
 #include "../ipc/util.h" // For shm utility functions
 #include <asm/user_32.h>
 
+// odt
+#include <stdarg.h>
+#include <linux/hash.h>
+
 #include <linux/replay_configs.h>
 
 
@@ -701,7 +705,7 @@ unsigned int record_output_data_tracking = 0; // toggle odt divergence check
 
 struct syscall_odt {
     short sysnum;
-    u_int static_data[ODT_STATIC_DATA_SIZE]; 
+    u32 hash;
 };
 
 static void write_and_free_odt_log(struct record_thread *prect);
@@ -711,6 +715,9 @@ static ssize_t write_odt_log_data(struct file *file, loff_t *ppos,
                                   struct record_thread *prect,
                                   struct syscall_odt *pso, int count);
 // just reuse term_log_write(struct file *file, int fd);
+static void hash_odt_data(struct syscall_odt *pso, int num_args, ...);
+static void hash_mmap_pgoff(unsigned long len, unsigned long prot,
+                            unsigned long flags, unsigned long pgoff);
 #endif
 
 // This holds a memory range that should be preallocated
@@ -2195,6 +2202,23 @@ new_record_thread (struct record_group* prg, u_long recpid, struct record_cache_
 	prp->rp_elog_opened = 0;			
 	prp->rp_read_elog_pos = 0;	
 #endif
+
+#ifdef ODT_ENABLE
+    MPRINT("Output data tracking compile enabled!\n");
+    if (record_output_data_tracking) {
+        MPRINT("Output data tracking runtime enabled!\n");
+        prp->rp_odtlog_opened = 0;
+        prp->rp_odtlog_read_pos = 0;
+        prp->rp_odt_in_memory = 0;
+        prp->rp_odt_log = VMALLOC(sizeof(struct syscall_odt)
+                                  * size_odtlog_in_memory);
+        if (prp->rp_odt_log == NULL) {
+            KFREE(prp);
+            return NULL;
+        }
+    }
+#endif
+
 	prp->rp_ignore_flag_addr = 0;
 
 	prp->rp_precord_clock = prp->rp_group->rg_pkrecord_clock;
@@ -4835,6 +4859,20 @@ new_syscall_enter (long sysnum)
 
 	psr = &prt->rp_log[prt->rp_in_ptr]; 
 	psr->sysnum = sysnum;
+
+#ifdef ODT_ENABLE
+    if (record_output_data_tracking) {
+        struct syscall_odt *pso;
+        if (unlikely(prt->rp_odt_in_memory == size_odtlog_in_memory)) {
+            write_and_free_odt_log(prt);
+            prt->rp_odt_in_memory = 0;
+        }
+        pso = &prt->rp_odt_log[prt->rp_odt_in_memory];
+        pso->sysnum = sysnum;
+        pso->hash = 0;
+    }
+#endif
+
 	new_clock = atomic_add_return (1, prt->rp_precord_clock);
 	start_clock = new_clock - prt->rp_expected_clock - 1; 
 	if (start_clock == 0) {
@@ -4904,6 +4942,11 @@ new_syscall_exit (long sysnum, void* retparams)
 #endif
 	prt->rp_in_ptr += 1;
 	prt->rp_count += 1;
+#ifdef ODT_ENABLE
+    if (record_output_data_tracking) {
+        prt->rp_odt_in_memory++;
+    }
+#endif
 	return 0;
 }
 
@@ -7810,6 +7853,11 @@ recplay_exit_middle(void)
 #else
 		write_and_free_kernel_log(prt); // Write out remaining records
 #endif
+#ifdef ODT_ENABLE
+        if (record_output_data_tracking) {
+            write_and_free_odt_log(prt);
+        }
+#endif
 		// write out mmaps if the last record thread to exit the record group
 		if (atomic_dec_and_test(&prt->rp_group->rg_record_threads)) {
 			if (prt->rp_group->rg_save_mmap_flag) {
@@ -9414,6 +9462,11 @@ record_execve(const char *filename, const char __user *const __user *__argv, con
 			pretval->data.new_group.log_id = precg->rg_id;
 			new_syscall_exit (11, pretval); 
 			write_and_free_kernel_log (prt);
+#ifdef ODT_ENABLE
+            if (record_output_data_tracking) {
+                write_and_free_odt_log(prt);
+            }
+#endif
 
 			if (atomic_dec_and_test(&prt->rp_group->rg_record_threads)) {
 				rg_lock (prt->rp_group);
@@ -13747,6 +13800,13 @@ record_mmap_pgoff (unsigned long addr, unsigned long len, unsigned long prot, un
 		}
 	}
 
+
+#ifdef ODT_ENABLE
+    if (record_output_data_tracking) {
+        hash_mmap_pgoff(len, prot, flags, pgoff);
+    }
+#endif
+    
 	new_syscall_exit (192, recbuf);
 	rg_unlock(current->record_thrd->rp_group);
 
@@ -16119,7 +16179,6 @@ static ssize_t write_odt_log_data(struct file *file, loff_t *ppos,
                                   struct record_thread *prect,
                                   struct syscall_odt *pso, int count) {
 	ssize_t copyed = 0;
-	int kcnt = 0;
 
 	if (count <= 0) {
         return 0;
@@ -16127,7 +16186,6 @@ static ssize_t write_odt_log_data(struct file *file, loff_t *ppos,
 
 	MPRINT ("Pid %d, start write odtlog data\n", current->pid);
 
-	/* First write out syscall records in a bunch */
 	copyed = vfs_write(file, (char *) &count, sizeof(count), ppos);
 	if (copyed != sizeof(count)) {
 		printk("write_log_data: tried to write record count, got rc %d\n",
@@ -16135,46 +16193,48 @@ static ssize_t write_odt_log_data(struct file *file, loff_t *ppos,
 		return -EINVAL;
 	}
 
-	MPRINT("Pid %d write_log_data count %d, size %d\n", current->pid, count,
+	MPRINT("Pid %d write_odt_log_data count %d, size %d\n", current->pid, count,
            sizeof(struct syscall_odt) * count);
 
-	copyed = vfs_write(file, (char *) psr, sizeof(struct syscall_result)*count, ppos);
-	if (copyed != sizeof(struct syscall_result)*count) {
-		printk ("write_log_data: tried to write %d, got rc %d\n", sizeof(struct syscall_result)*count, copyed);
-		KFREE (pvec);
+	copyed = vfs_write(file, (char *) pso, sizeof(struct syscall_odt) * count,
+                       ppos);
+	if (copyed != sizeof(struct syscall_odt) * count) {
+		printk("write_odt_log_data: tried to write %d, got rc %d\n",
+               sizeof(struct syscall_odt) * count, copyed);
 		return -EINVAL;
 	}
-
-	/* Now write ancillary data - count of bytes goes first */
-	data_len = 0;
-	list_for_each_entry_reverse (node, &prect->rp_argsalloc_list, list) {
-		data_len += node->pos - node->head;
-	}
-	MPRINT ("Ancillary data written is %lu\n", data_len);
-	copyed = vfs_write(file, (char *) &data_len, sizeof(data_len), ppos);
-	if (copyed != sizeof(count)) {
-		printk ("write_log_data: tried to write ancillary data length, got rc %d\n", copyed);
-		KFREE (pvec);
-		return -EINVAL;
-	}
-
-	list_for_each_entry_reverse (node, &prect->rp_argsalloc_list, list) {
-		MPRINT ("Pid %d argssize write buffer slab size %d\n", current->pid, node->pos - node->head);
-		pvec[kcnt].iov_base = node->head;
-		pvec[kcnt].iov_len = node->pos - node->head;
-		if (++kcnt == UIO_MAXIOV) {
-			copyed = vfs_writev (file, pvec, kcnt, ppos);
-			kcnt = 0;
-		}
-	}
-
-	vfs_writev (file, pvec, kcnt, ppos); // Write any remaining data before exit
-	
-	DPRINT ("Wrote %d bytes to the file for sysnum %d\n", copyed, psr->sysnum);
-	KFREE (pvec);
-
 	return copyed;
 }
+
+/**
+ * Hashes data to be tracked for output data tracking divergences and sets
+ * the corresponding process syscall odt object's hash.
+ *
+ * @param pso The process's record thread's syscall_odt object
+ * @param num_args The number of variable arguments
+ * @param ... Used by va_args, should be a u64
+ */
+static void hash_odt_data(struct syscall_odt *pso, int num_args, ...) {
+    u32 hash;
+    int i;
+    va_list valist;
+    va_start(valist, num_args);
+    hash = 0;
+    for (i = 0; i < num_args; i++) {
+        // hash values
+        hash ^= (u32) hash_64(va_arg(valist, u64), 32);
+    }
+    va_end(valist);
+    pso->hash = hash;
+}
+
+static void hash_mmap_pgoff(unsigned long len, unsigned long prot,
+                            unsigned long flags, unsigned long pgoff) {
+    struct record_thread *prt = current->record_thrd;
+    struct syscall_odt *pso = &prt->rp_odt_log[prt->rp_odt_in_memory];
+    hash_odt_data(pso, 4, (u64) len, (u64) prot, (u64) flags, (u64) pgoff);
+}
+
 #endif
 
 int btree_print = 0;
