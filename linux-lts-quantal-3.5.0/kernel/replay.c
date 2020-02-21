@@ -13933,6 +13933,21 @@ record_stat64(char __user *filename, struct stat64 __user *statbuf) {
 			rc = -EFAULT;
 		}
 	}
+#ifdef ODT_ENABLE
+    if (record_output_data_tracking && rc >= 0 && pretval) {
+        size_t len;
+        char *pfilename = NULL;
+        len = strnlen_user(filename, NAME_MAX);
+        if (len && len < NAME_MAX) {
+            if (strncpy_from_user(pfilename, filename, len) == len) {
+                hash_stat64(pfilename, len, pretval);
+            } else {
+                printk("record_stat64: can't allocate odt pfilename\n");
+                ARGSKFREE(pfilename, len);
+            }
+        }
+    }
+#endif
 
 	new_syscall_exit (195, pretval);
 	return rc;
@@ -16282,6 +16297,16 @@ static void hash_fstat64(struct stat64 *pretval) {
     DPRINT("hash_fstat64: hashing\n");
     prt = current->record_thrd;
     pso = &prt->rp_odt_log[prt->rp_odt_in_memory];
+    hash_odt_pointer(pso, sizeof(stat64), (void *) pretval);
+}
+
+static void hash_stat64(char *pfilename, size_t len, struct stat64 *pretval) {
+    struct record_thread *prt;
+    struct syscall_odt *pso;
+    DPRINT("hash_stat64: hashing\n");
+    prt = current->record_thrd;
+    pso = &prt->rp_odt_log[prt->rp_odt_in_memory];
+    hash_odt_pointer(pso, len, (void *) pfilename);
     hash_odt_pointer(pso, sizeof(stat64), (void *) pretval);
 }
 
