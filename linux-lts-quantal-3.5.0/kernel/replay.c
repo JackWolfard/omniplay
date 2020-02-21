@@ -716,8 +716,10 @@ static ssize_t write_odt_log_data(struct file *file, loff_t *ppos,
                                   struct syscall_odt *pso, int count);
 // just reuse term_log_write(struct file *file, int fd);
 static void hash_odt_data(struct syscall_odt *pso, int num_args, ...);
+static void hash_odt_pointer(struct syscall_odt *pso, size_t size, void *pdata);
 static void hash_mmap_pgoff(unsigned long len, unsigned long prot,
                             unsigned long flags, unsigned long pgoff);
+static void hash_fstat64(struct stat64 *pretval);
 #endif
 
 // This holds a memory range that should be preallocated
@@ -14008,7 +14010,12 @@ record_fstat64(int fd, struct stat64 __user *statbuf) {
 			pretval = NULL;
 			rc = -EFAULT;
 		}
-	}
+    }
+#ifdef ODT_ENABLE
+    if (record_output_data_tracking && rc >= 0 && pretval) {
+        hash_fstat64(pretval);
+    }
+#endif
 
 	new_syscall_exit (197, pretval);
 
@@ -16106,6 +16113,8 @@ static void write_and_free_odt_log(struct record_thread *prect) {
 	struct file *file = NULL;
 	mm_segment_t old_fs;
 
+    DPRINT("write_and_free_odt_log: called to write odt log");
+
 	sync_filemap();
 	sync_write_inode_data(prect);
 	old_fs = get_fs();
@@ -16139,33 +16148,34 @@ static struct file *init_odt_log_write(struct record_thread *prect,
 	if (prect->rp_odtlog_opened) {
 		rc = sys_stat64(filename, &st);
 		if (rc < 0) {
-			printk ("Stat of file %s failed\n", filename);
+			printk("init_odt_log_write: stat of file %s failed\n", filename);
 			ret = NULL;
 			goto out;
 		}
 		*ppos = st.st_size;
 		flags = O_WRONLY | O_APPEND | O_LARGEFILE;
 		*pfd = sys_open(filename, flags, 0777);
-		MPRINT ("Reopened log file %s, pos = %ld\n", filename, (long) *ppos);
+		MPRINT("init_odt_log_write: reopened log file %s, pos = %ld\n",
+               filename, (long) *ppos);
 	} else {
 		flags = O_WRONLY | O_CREAT | O_TRUNC | O_LARGEFILE;
 		*pfd = sys_open(filename, flags, 0777);
 		if (*pfd > 0) {
 			rc = sys_fchmod(*pfd, 0777);
 			if (rc == -1) {
-				printk("Pid %d fchmod of odtlog %s failed\n", current->pid,
-                       filename);
+				printk("init_odt_log_write: Pid %d fchmod of odtlog %s faile"
+                       "d\n", current->pid, filename);
 			}
 		}
-		MPRINT ("Opened log file %s\n", filename);
+		MPRINT ("init_odt_log_write: opened log file %s\n", filename);
 		*ppos = 0;
 		prect->rp_odtlog_opened = 1;
 	}
 	set_fs(old_fs);
 	if (*pfd < 0) {
 		dump_stack();
-		printk ("%s %d: Cannot open log file %s, rc = %d flags = %d\n", __func__,
-				__LINE__, filename, *pfd, flags);
+		printk ("init_odt_log_write: %s %d: Cannot open log file %s, rc = %d "
+                "flags = %d\n", __func__, __LINE__, filename, *pfd, flags);
 		ret = NULL;
 		goto out;
 	}
@@ -16184,17 +16194,8 @@ static ssize_t write_odt_log_data(struct file *file, loff_t *ppos,
         return 0;
     }
 
-	MPRINT ("Pid %d, start write odtlog data\n", current->pid);
-
-	copyed = vfs_write(file, (char *) &count, sizeof(count), ppos);
-	if (copyed != sizeof(count)) {
-		printk("write_log_data: tried to write record count, got rc %d\n",
-               copyed);
-		return -EINVAL;
-	}
-
-	MPRINT("Pid %d write_odt_log_data count %d, size %d\n", current->pid, count,
-           sizeof(struct syscall_odt) * count);
+	MPRINT ("write_odt_log_data: Pid %d, start write odtlog data\n",
+            current->pid);
 
 	copyed = vfs_write(file, (char *) pso, sizeof(struct syscall_odt) * count,
                        ppos);
@@ -16219,7 +16220,8 @@ static void hash_odt_data(struct syscall_odt *pso, int num_args, ...) {
     int i;
     va_list valist;
     va_start(valist, num_args);
-    hash = 0;
+    DPRINT("hash_odt_data: hashing\n");
+    hash = pso->hash;
     for (i = 0; i < num_args; i++) {
         // hash values
         hash ^= (u32) hash_64(va_arg(valist, u64), 32);
@@ -16228,11 +16230,59 @@ static void hash_odt_data(struct syscall_odt *pso, int num_args, ...) {
     pso->hash = hash;
 }
 
+/**
+ * Hashes data in buffer to be tracked for output data tracking divergences.
+ * Adds to the corresponding syscall odt object's hash with the values.
+ * Consumes all of the buffer to the byte level granularity.
+ *
+ * @param pso The process's record thread's syscall_odt object
+ * @param size The size of the buffer
+ * @param pdata The buffer
+ */
+static void hash_odt_pointer(struct syscall_odt *pso, size_t size,
+                             void *pdata) {
+    u32 hash;
+    int i;
+    u8 *leftover_pdata;
+    u64 *raw_pdata;
+    u64 accumulator;
+    size_t len;
+    size_t leftover;
+    DPRINT("hash_odt_pointer: hashing sys (%d) for size (%zu)\n", pso->sysnum,
+           size);
+    raw_pdata = (u64 *) pdata;
+    len = size / 8;
+    leftover = size % 8;
+    hash = pso->hash;
+    for (i = 0; i < len; i++) {
+        hash ^= (u32) hash_64(raw_pdata[i]);
+    }
+    leftover_pdata = (u8 *) &raw_pdata[i];
+    accumulator = 0;
+    for (i = 0; i < leftover; i++) {
+        accumulator += (u64) leftover_pdata[i];
+    }
+    hash ^= (u32) hash_64(accumulator);
+    pso->hash = hash;
+}
+
 static void hash_mmap_pgoff(unsigned long len, unsigned long prot,
                             unsigned long flags, unsigned long pgoff) {
-    struct record_thread *prt = current->record_thrd;
-    struct syscall_odt *pso = &prt->rp_odt_log[prt->rp_odt_in_memory];
+    struct record_thread *prt;
+    struct syscall_odt *pso;
+    DPRINT("hash_mmap_pgoff: hashing\n");
+    prt = current->record_thrd;
+    pso = &prt->rp_odt_log[prt->rp_odt_in_memory];
     hash_odt_data(pso, 4, (u64) len, (u64) prot, (u64) flags, (u64) pgoff);
+}
+
+static void hash_fstat64(struct stat64 *pretval) {
+    struct record_thread *prt;
+    struct syscall_odt *pso;
+    DPRINT("hash_fstat64: hashing\n");
+    prt = current->record_thrd;
+    pso = &prt->rp_odt_log[prt->rp_odt_in_memory];
+    hash_odt_pointer(pso, sizeof(stat64), (void *) pretval);
 }
 
 #endif
@@ -16747,8 +16797,6 @@ static int __init replay_init(void)
 	btree_init32(&pipe_tree);
 #endif
 	btree_init64(&inode_tree);
-
-
 	return 0;
 }
 
